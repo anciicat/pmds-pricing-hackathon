@@ -12,6 +12,13 @@ Kratak pregled (detaljno objasnjenje je u razgovoru / README tima):
 3. AUKCIJA - za svaki materijal nudimo rezervna_cena * m. Dodatak m raste kad
              izgubimo (delimicno ili potpuno), a polako pada kad sve dobijemo.
              m je ograniceno vrednoscu materijala u proizvodu.
+4. ODRZIVOST (verzija 2, posle zvanicnih rezultata):
+             - pod cene racuna STVARNO placenu cenu materijala;
+             - cena ne pada ispod pola najbolje nedavne prodajne cene;
+             - ne proizvodi ako se ne isplati po ocekivanoj nabavnoj ceni;
+             - agresivnije licitiranje: u guzvi je aukcija usko grlo, a ko
+               dobije komplete materijala, taj ima robu i kupce;
+             - ucenje broji samo robu koja je zaista bila istaknuta.
 
 Sve se izvodi iz recepata i onoga sto agent vidi; nista nije vezano za
 konkretan scenario.
@@ -69,14 +76,14 @@ class LadderAgent(BaseAgent):
     Q_SELLOUT_GROWTH = 1.25         # rasprodato -> Q raste
     Q_SMOOTHING = 0.4               # tezina nove prodaje u proseku
     MIN_Q = 1.0
-    STOCK_BUFFER = 1.7              # ciljni lager = Q * ovo
+    STOCK_BUFFER = 2.3              # ciljni lager = Q * ovo
 
     # --- aukcija ---
     M_START = 1.05                  # pocetni dodatak na rezervnu cenu
     M_MIN = 1.01
     M_DOWN = 0.93                   # dobili sve -> m * ovo
-    M_UP_PARTIAL = 1.30             # dobili deo -> m * ovo
-    M_UP_NONE = 1.50                # nismo dobili nista -> m * ovo
+    M_UP_PARTIAL = 1.50             # dobili deo -> m * ovo
+    M_UP_NONE = 2.00                # nismo dobili nista -> m * ovo
     VALUE_CAP_SHARE = 0.8           # najvise ovoliki deo vrednosti materijala
     BUDGET_SHARE = 0.6              # najvise ovoliki deo kapitala po aukciji
 
@@ -98,6 +105,25 @@ class LadderAgent(BaseAgent):
     COMP_RAW_PRESSURE = 0.3         # konkurenti uzeli > ovaj deo lota ...
     COMP_RAW_BUMP = 1.10            # ... onda unapred dizemo ponudu
 
+    # --- odrzivost (posle zvanicnih rezultata: ne gubiti novac u guzvi) ---
+    # (1) trosak se racuna po STVARNO placenoj ceni materijala, ne po rezervnoj
+    USE_PAID_COST = True
+    PAID_COST_DECAY = 0.8           # tezina stare prosecne cene u proseku
+    # (2) cena ne pada ispod ovog dela najbolje nedavne prodajne cene
+    PRICE_MEMORY_FLOOR = 0.5
+    PRICE_MEMORY_DECAY = 0.97       # "najbolja cena" polako zaboravlja
+    # (3) ne proizvodi ako se ne isplati po ocekivanoj nabavnoj ceni
+    PRODUCE_MIN_MARGIN = 1.15       # 0.9*R mora biti >= ocekivani trosak * ovo
+    # (4) apsolutni plafon za dodatak na aukciji
+    M_MAX = 50.0                    # prakticno bez plafona; stiti VALUE_CAP_SHARE
+    # (5) guzva: mnogo timova -> manje robe dok otkrivamo cenu
+    CROWD_TEAMS = 8                 # vise od ovoliko timova = guzva
+    CROWD_DISCOVERY_STOCK = 2
+    # (6) zastita kapitala: ispod start * ovo -> oprezan rezim
+    PROTECT_DRAWDOWN = 0.0          # 0 = iskljuceno (testovi: zastita smeta oporavku)
+    PROTECT_M_MAX = 1.3
+    PROTECT_BUFFER = 1.2
+
     def __init__(self) -> None:
         self.my_id: str | None = None
         self.R: dict[str, float] = {}          # referentna cena po proizvodu
@@ -116,6 +142,12 @@ class LadderAgent(BaseAgent):
         self.foreign_sales: dict[str, list[float]] = {}  # tudje prodajne cene
         self.foreign_bid_max: dict[str, float] = {}  # najvisa tudja cena na aukciji
         self.fill_short: dict[str, bool] = {}       # da li nismo dobili sve
+        # odrzivost
+        self.paid_avg: dict[str, float] = {}        # prosecna placena cena materijala
+        self.best_price: dict[str, float] = {}      # najbolja nedavna prodajna cena
+        self.start_capital: float | None = None
+        self.protect = False                        # oprezan rezim
+        self.crowded = False
 
     # ------------------------------------------------------------------
     # glavna funkcija
@@ -128,11 +160,22 @@ class LadderAgent(BaseAgent):
             self.last_reserve[lot.good] = lot.reserve_price
         lots = {lot.good: lot for lot in state.auction_lots}
 
+        if self.start_capital is None:
+            self.start_capital = state.capital
+        self.crowded = len(state.public_capital) > self.CROWD_TEAMS
+        if self.protect:
+            self.protect = state.capital < self.start_capital
+        else:
+            self.protect = state.capital < self.start_capital * self.PROTECT_DRAWDOWN
+
         recipe_for = self._cheapest_recipes(goods_config)
+        # trosak = vece od (danasnja rezervna cena, ono sto smo stvarno platili)
         cost = {
-            good: self._recipe_cost(recipe)
+            good: self._floor_cost(recipe)
             for good, (_, recipe) in recipe_for.items()
         }
+        for good in self.best_price:
+            self.best_price[good] *= self.PRICE_MEMORY_DECAY
 
         for good in goods_config.finished_goods:
             if good not in self.R:
@@ -193,6 +236,30 @@ class LadderAgent(BaseAgent):
             for material, amount in recipe.inputs.items()
         )
 
+    def _floor_cost(self, recipe) -> float:
+        """Trosak za pod cene: po materijalu veca od rezervne i placene cene."""
+        if not self.USE_PAID_COST:
+            return self._recipe_cost(recipe)
+        return sum(
+            max(self.last_reserve.get(material, 0.0), self.paid_avg.get(material, 0.0))
+            * amount
+            for material, amount in recipe.inputs.items()
+        )
+
+    def _expected_cost(self, good: str, recipe) -> float:
+        """Koliko ce nas materijal verovatno kostati: rezervna * m, ali ne vise
+        od plafona vrednosti (isto ogranicenje koje vazi i za samu ponudu)."""
+        m_max = self.PROTECT_M_MAX if self.protect else self.M_MAX
+        floor = self._floor_cost(recipe)
+        total = 0.0
+        for material, amount in recipe.inputs.items():
+            reserve = self.last_reserve.get(material, 0.0)
+            price = reserve * min(self.m.get(material, self.M_START), m_max)
+            others = floor - reserve * amount
+            cap = (self.R[good] * self.TIER_LOW - others) / amount * self.VALUE_CAP_SHARE
+            total += max(reserve, min(price, cap)) * amount
+        return total
+
     def _cheapest_recipes(self, goods_config: GoodsConfig):
         best: dict[str, tuple[str, object]] = {}
         for name, recipe in goods_config.recipes.items():
@@ -240,13 +307,31 @@ class LadderAgent(BaseAgent):
             if self._is_mine(sale.seller):
                 key = (sale.good, round(sale.price, 6))
                 sold_at[key] = sold_at.get(key, 0) + sale.quantity
+                self.best_price[sale.good] = max(
+                    self.best_price.get(sale.good, 0.0), sale.price
+                )
             else:
                 self.foreign_sales.setdefault(sale.good, []).extend(
                     [sale.price] * sale.quantity
                 )
 
+        # Koliko je robe ZAISTA bilo istaknuto: ako aukcija nije donela
+        # materijal, plan je bio veci od robe. Simulator puni oglase redom,
+        # pa i mi tako delimo stvarnu kolicinu (= prodato + ostalo na lageru).
+        sold_total: dict[str, int] = {}
+        for (good, _), qty in sold_at.items():
+            sold_total[good] = sold_total.get(good, 0) + qty
+        available = {
+            good: sold_total.get(good, 0) + state.inventory.get(good, 0)
+            for good, _, _ in self.last_listings
+        }
+
         tiers_by_good: dict[str, list[tuple[float, int, int]]] = {}
         for good, price, qty in self.last_listings:
+            qty = min(qty, available[good])
+            available[good] -= qty
+            if qty <= 0:
+                continue
             key = (good, round(price, 6))
             sold = min(qty, sold_at.get(key, 0))
             sold_at[key] = sold_at.get(key, 0) - sold
@@ -290,7 +375,11 @@ class LadderAgent(BaseAgent):
                 else:
                     self.R[good] *= self.DOWN_NOTHING
 
-            self.R[good] = max(self.R[good], cost.get(good, 0.0) * self.MIN_MARGIN)
+            self.R[good] = max(
+                self.R[good],
+                cost.get(good, 0.0) * self.MIN_MARGIN,
+                self.best_price.get(good, 0.0) * self.PRICE_MEMORY_FLOOR,
+            )
 
             # procena prodaje po potezu: ako se rasprodalo sve sto je bilo
             # po ceni <= R (nizak i srednji nivo), kupaca ima vise nego robe.
@@ -323,9 +412,13 @@ class LadderAgent(BaseAgent):
         self.auctions_seen = len(state.auction_transactions)
         won: dict[str, int] = {}
         self.foreign_bid_max = {}
+        spent: dict[str, float] = {}
         for result in new:
             if self._is_mine(result.buyer):
                 won[result.good] = won.get(result.good, 0) + result.quantity
+                spent[result.good] = (
+                    spent.get(result.good, 0.0) + result.price * result.quantity
+                )
             else:
                 self.foreign_bid_max[result.good] = max(
                     self.foreign_bid_max.get(result.good, 0.0), result.price
@@ -335,6 +428,17 @@ class LadderAgent(BaseAgent):
             for good, requested in self.last_bids.items()
             if requested > 0
         }
+
+        # (1) prosecna stvarno placena cena po materijalu
+        for good, total in spent.items():
+            turn_avg = total / won[good]
+            if good in self.paid_avg:
+                self.paid_avg[good] = (
+                    self.PAID_COST_DECAY * self.paid_avg[good]
+                    + (1 - self.PAID_COST_DECAY) * turn_avg
+                )
+            else:
+                self.paid_avg[good] = turn_avg
 
         for good, requested in self.last_bids.items():
             if requested <= 0:
@@ -347,7 +451,14 @@ class LadderAgent(BaseAgent):
                 m *= self.M_UP_PARTIAL
             else:
                 m *= self.M_UP_NONE
-            self.m[good] = max(self.M_MIN, m)
+            self.m[good] = min(self.M_MAX, max(self.M_MIN, m))
+
+        # materijali za koje nismo licitirali: m polako pada. Bez ovoga agent
+        # moze da se zaglavi (visok m -> "ne isplati se" -> ne licitira -> m
+        # se nikad ne menja).
+        for good in self.m:
+            if self.last_bids.get(good, 0) <= 0:
+                self.m[good] = max(self.M_MIN, self.m[good] * self.M_DOWN)
 
     # --- odluke -------------------------------------------------------
 
@@ -358,9 +469,12 @@ class LadderAgent(BaseAgent):
                 continue
             stock = state.inventory.get(good, 0)
             if self.discovery[good]:
-                target = max(self.DISCOVERY_STOCK, ceil(self.Q[good]))
+                disc_stock = (
+                    self.CROWD_DISCOVERY_STOCK if self.crowded else self.DISCOVERY_STOCK
+                )
+                target = max(disc_stock, ceil(self.Q[good]))
             else:
-                buffer = self.STOCK_BUFFER
+                buffer = self.PROTECT_BUFFER if self.protect else self.STOCK_BUFFER
                 # (c) konkurenti vec drze mnogo ovog proizvoda -> ocekuj da ce
                 # ga obarati, pa ne pravi veliki lager
                 if self.USE_COMP_STOCK and self.comp_finished.get(good, 0) > (
@@ -370,6 +484,11 @@ class LadderAgent(BaseAgent):
                 target = ceil(self.Q[good] * buffer)
             # ne proizvodi ako se ne isplati
             if not self.discovery[good] and self.R[good] < cost[good] * self.MIN_MARGIN:
+                target = 0
+            # (3) ni po ocekivanoj nabavnoj ceni (rezervna * m) se ne isplati
+            if not self.discovery[good] and self.R[good] * self.TIER_LOW < (
+                self._expected_cost(good, recipe_for[good][1]) * self.PRODUCE_MIN_MARGIN
+            ):
                 target = 0
             production[good] = max(0, target - stock)
         return production
@@ -400,7 +519,8 @@ class LadderAgent(BaseAgent):
             if qty <= 0:
                 continue
             m = self.m.setdefault(material, self.M_START)
-            price = lot.reserve_price * m
+            m_max = self.PROTECT_M_MAX if self.protect else self.M_MAX
+            price = lot.reserve_price * min(m, m_max)
             # (b) vidimo po kojoj ceni su drugi pobedili, a nama je falilo
             if (
                 self.USE_VISIBLE_BIDS
@@ -413,6 +533,7 @@ class LadderAgent(BaseAgent):
                 self.COMP_RAW_PRESSURE * lot.quantity
             ):
                 price *= self.COMP_RAW_BUMP
+            price = min(price, lot.reserve_price * m_max)
             cap = value_cap.get(material, 0.0) * self.VALUE_CAP_SHARE
             if cap > lot.reserve_price:
                 price = min(price, cap)
