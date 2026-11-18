@@ -80,6 +80,24 @@ class LadderAgent(BaseAgent):
     VALUE_CAP_SHARE = 0.8           # najvise ovoliki deo vrednosti materijala
     BUDGET_SHARE = 0.6              # najvise ovoliki deo kapitala po aukciji
 
+    # --- pracenje konkurenata ---
+    # Testirano protiv stare verzije (20 seed-ova, 6 scenarija): nijedna
+    # funkcija nije donela merljiv pomak. (a) je neutralna i ostaje ukljucena;
+    # (b) neutralna; (c) i (d) su blago odmagale, pa su iskljucene.
+    # (a) tudje prodaje, ako ih scenario prikazuje (observe_all_transactions)
+    USE_VISIBLE_SALES = True
+    # (b) tudje cene na aukciji, ako ih scenario prikazuje
+    USE_VISIBLE_BIDS = False
+    VISIBLE_BID_STEP = 1.01         # nudi ovoliko iznad najvise tudje cene
+    # (c) javne zalihe gotovih proizvoda konkurenata
+    USE_COMP_STOCK = False
+    COMP_STOCK_RATIO = 4.0          # konkurenti imaju > ovo * Q komada ...
+    COMP_STOCK_BUFFER = 1.2         # ... onda drzimo manji lager (Q * ovo)
+    # (d) javne zalihe sirovina konkurenata (ko gomila materijal)
+    USE_COMP_RAW = False
+    COMP_RAW_PRESSURE = 0.3         # konkurenti uzeli > ovaj deo lota ...
+    COMP_RAW_BUMP = 1.10            # ... onda unapred dizemo ponudu
+
     def __init__(self) -> None:
         self.my_id: str | None = None
         self.R: dict[str, float] = {}          # referentna cena po proizvodu
@@ -91,6 +109,13 @@ class LadderAgent(BaseAgent):
         self.last_bids: dict[str, int] = {}
         self.sales_seen = 0
         self.auctions_seen = 0
+        # konkurenti
+        self.prev_public: dict[str, dict[str, int]] = {}
+        self.comp_finished: dict[str, int] = {}     # njihove zalihe proizvoda
+        self.comp_raw_gain: dict[str, int] = {}     # koliko su sirovina dodali
+        self.foreign_sales: dict[str, list[float]] = {}  # tudje prodajne cene
+        self.foreign_bid_max: dict[str, float] = {}  # najvisa tudja cena na aukciji
+        self.fill_short: dict[str, bool] = {}       # da li nismo dobili sve
 
     # ------------------------------------------------------------------
     # glavna funkcija
@@ -117,6 +142,7 @@ class LadderAgent(BaseAgent):
                 self.Q[good] = self.INITIAL_Q
 
         # 1) ucimo iz proslog poteza
+        self._observe_competitors(state, goods_config)
         self._learn_from_sales(state, cost)
         self._learn_from_auction(state)
 
@@ -179,15 +205,45 @@ class LadderAgent(BaseAgent):
 
     # --- ucenje -------------------------------------------------------
 
+    def _observe_competitors(self, state: Observation, goods_config: GoodsConfig) -> None:
+        """Iz javnih zaliha: koliko robe drze konkurenti i koliko sirovina dodaju."""
+        self.comp_finished = {}
+        self.comp_raw_gain = {}
+        if self.my_id is None:
+            return
+        for team, inventory in state.public_inventories.items():
+            if team == self.my_id:
+                continue
+            for good in goods_config.finished_goods:
+                self.comp_finished[good] = (
+                    self.comp_finished.get(good, 0) + inventory.get(good, 0)
+                )
+            previous = self.prev_public.get(team)
+            if previous is not None:
+                for material in goods_config.raw_materials:
+                    gain = inventory.get(material, 0) - previous.get(material, 0)
+                    if gain > 0:
+                        self.comp_raw_gain[material] = (
+                            self.comp_raw_gain.get(material, 0) + gain
+                        )
+        self.prev_public = {
+            team: dict(inventory) for team, inventory in state.public_inventories.items()
+        }
+
     def _learn_from_sales(self, state: Observation, cost: dict[str, float]) -> None:
         new_sales = state.sales_transactions[self.sales_seen:]
         self.sales_seen = len(state.sales_transactions)
 
         sold_at: dict[tuple[str, float], int] = {}
+        self.foreign_sales = {}
         for sale in new_sales:
             if self._is_mine(sale.seller):
                 key = (sale.good, round(sale.price, 6))
                 sold_at[key] = sold_at.get(key, 0) + sale.quantity
+            else:
+                self.foreign_sales.setdefault(sale.good, []).extend(
+                    [sale.price] * sale.quantity
+                )
 
         tiers_by_good: dict[str, list[tuple[float, int, int]]] = {}
         for good, price, qty in self.last_listings:
@@ -248,13 +304,37 @@ class LadderAgent(BaseAgent):
                 )
             self.Q[good] = max(self.MIN_Q, self.Q[good])
 
+        # (a) tudje prodaje (vidljive samo u nekim scenarijima): ako drugi
+        # prodaju skuplje od nas, nasa cena je verovatno preniska.
+        if self.USE_VISIBLE_SALES:
+            for good, prices in self.foreign_sales.items():
+                if good not in self.R or not prices:
+                    continue
+                prices.sort()
+                median = prices[len(prices) // 2]
+                if self.discovery[good]:
+                    self.R[good] = max(median, cost.get(good, 0.0) * self.MIN_MARGIN)
+                    self.discovery[good] = False
+                elif median > self.R[good] * self.TIER_HIGH:
+                    self.R[good] *= self.UP_HIGH_SOLD
+
     def _learn_from_auction(self, state: Observation) -> None:
         new = state.auction_transactions[self.auctions_seen:]
         self.auctions_seen = len(state.auction_transactions)
         won: dict[str, int] = {}
+        self.foreign_bid_max = {}
         for result in new:
             if self._is_mine(result.buyer):
                 won[result.good] = won.get(result.good, 0) + result.quantity
+            else:
+                self.foreign_bid_max[result.good] = max(
+                    self.foreign_bid_max.get(result.good, 0.0), result.price
+                )
+        self.fill_short = {
+            good: won.get(good, 0) < requested
+            for good, requested in self.last_bids.items()
+            if requested > 0
+        }
 
         for good, requested in self.last_bids.items():
             if requested <= 0:
@@ -280,7 +360,14 @@ class LadderAgent(BaseAgent):
             if self.discovery[good]:
                 target = max(self.DISCOVERY_STOCK, ceil(self.Q[good]))
             else:
-                target = ceil(self.Q[good] * self.STOCK_BUFFER)
+                buffer = self.STOCK_BUFFER
+                # (c) konkurenti vec drze mnogo ovog proizvoda -> ocekuj da ce
+                # ga obarati, pa ne pravi veliki lager
+                if self.USE_COMP_STOCK and self.comp_finished.get(good, 0) > (
+                    self.COMP_STOCK_RATIO * max(self.Q[good], 1.0)
+                ):
+                    buffer = min(buffer, self.COMP_STOCK_BUFFER)
+                target = ceil(self.Q[good] * buffer)
             # ne proizvodi ako se ne isplati
             if not self.discovery[good] and self.R[good] < cost[good] * self.MIN_MARGIN:
                 target = 0
@@ -314,6 +401,18 @@ class LadderAgent(BaseAgent):
                 continue
             m = self.m.setdefault(material, self.M_START)
             price = lot.reserve_price * m
+            # (b) vidimo po kojoj ceni su drugi pobedili, a nama je falilo
+            if (
+                self.USE_VISIBLE_BIDS
+                and self.fill_short.get(material)
+                and material in self.foreign_bid_max
+            ):
+                price = max(price, self.foreign_bid_max[material] * self.VISIBLE_BID_STEP)
+            # (d) konkurenti su prosli put pokupili veliki deo lota
+            if self.USE_COMP_RAW and self.comp_raw_gain.get(material, 0) >= (
+                self.COMP_RAW_PRESSURE * lot.quantity
+            ):
+                price *= self.COMP_RAW_BUMP
             cap = value_cap.get(material, 0.0) * self.VALUE_CAP_SHARE
             if cap > lot.reserve_price:
                 price = min(price, cap)
